@@ -2,6 +2,7 @@ from __future__ import division
 from math import sqrt as sqrt
 from itertools import product as product
 import torch
+import torch.nn as nn
 
 
 class PriorBox(object):

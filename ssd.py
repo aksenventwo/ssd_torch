@@ -31,7 +31,9 @@ class SSD(nn.Module):
         self.num_classes = num_classes
         self.cfg = (coco, voc)[num_classes == 21]
         self.priorbox = PriorBox(self.cfg)
-        self.priors = Variable(self.priorbox.forward(), volatile=True)
+        #self.priors = Variable(self.priorbox.forward(), volatile=True)
+        self.priors = self.priorbox.forward()
+        #self.priors = torch.ones([6, 4], dtype=torch.float32)
         self.size = size
 
         # SSD network
@@ -66,9 +68,9 @@ class SSD(nn.Module):
                     2: localization layers, Shape: [batch,num_priors*4]
                     3: priorbox layers, Shape: [2,num_priors*4]
         """
-        sources = list()
-        loc = list()
-        conf = list()
+        sources = []
+        loc = []
+        conf = []
 
         # apply vgg up to conv4_3 relu
         for k in range(23):
@@ -97,10 +99,9 @@ class SSD(nn.Module):
         conf = torch.cat([o.view(o.size(0), -1) for o in conf], 1)
         if self.phase == "test":
             output = self.detect(
-                loc.view(loc.size(0), -1, 4),                   # loc preds
-                self.softmax(conf.view(conf.size(0), -1,
-                             self.num_classes)),                # conf preds
-                self.priors.type(type(x.data))                  # default boxes
+                loc.view(loc.size(0), -1, 4),                                  # loc preds
+                self.softmax(conf.view(conf.size(0), -1, self.num_classes)),   # conf preds
+                self.priors.type(x.dtype)                                      # default boxes
             )
         else:
             output = (

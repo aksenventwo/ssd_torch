@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
 import torch
-
+from typing import Dict, List, Tuple
 
 def point_form(boxes):
     """ Convert prior_boxes to (xmin, ymin, xmax, ymax)
@@ -22,8 +21,8 @@ def center_size(boxes):
     Return:
         boxes: (tensor) Converted xmin, ymin, xmax, ymax form of boxes.
     """
-    return torch.cat((boxes[:, 2:] + boxes[:, :2])/2,  # cx, cy
-                     boxes[:, 2:] - boxes[:, :2], 1)  # w, h
+    return torch.cat(((boxes[:, 2:] + boxes[:, :2])/2,  # cx, cy
+                     boxes[:, 2:] - boxes[:, :2]), 1)  # w, h
 
 
 def intersect(box_a, box_b):
@@ -137,7 +136,7 @@ def encode(matched, priors, variances):
 
 
 # Adapted from https://github.com/Hakuyume/chainer-ssd
-def decode(loc, priors, variances):
+def decode(loc, priors):
     """Decode locations from predictions using priors to undo
     the encoding we did for offset regression at train time.
     Args:
@@ -149,12 +148,14 @@ def decode(loc, priors, variances):
     Return:
         decoded bounding box predictions
     """
-
     boxes = torch.cat((
-        priors[:, :2] + loc[:, :2] * variances[0] * priors[:, 2:],
-        priors[:, 2:] * torch.exp(loc[:, 2:] * variances[1])), 1)
-    boxes[:, :2] -= boxes[:, 2:] / 2
-    boxes[:, 2:] += boxes[:, :2]
+        priors[:, :2] + loc[:, :2] * priors[:, 2:] * 0.1,
+        priors[:, 2:] * torch.exp(loc[:, 2:] * 0.2)), 1)
+    #boxes[:, :2] -= boxes[:, 2:] / 2
+    #boxes[:, 2:] += boxes[:, :2]
+    xboxes = boxes[:, :2] - (boxes[:, 2:] / 2)
+    yboxes = boxes[:, 2:] + xboxes
+    boxes = torch.cat([xboxes, yboxes], 1)
     return boxes
 
 
@@ -169,10 +170,8 @@ def log_sum_exp(x):
     return torch.log(torch.sum(torch.exp(x-x_max), 1, keepdim=True)) + x_max
 
 
-# Original author: Francisco Massa:
-# https://github.com/fmassa/object-detection.torch
-# Ported to PyTorch by Max deGroot (02/01/2017)
-def nms(boxes, scores, overlap=0.5, top_k=200):
+@torch.jit.script
+def nms(boxes, scores, overlap):
     """Apply non-maximum suppression at test time to avoid detecting too many
     overlapping bounding boxes for a given object.
     Args:
@@ -183,57 +182,42 @@ def nms(boxes, scores, overlap=0.5, top_k=200):
     Return:
         The indices of the kept boxes with respect to num_priors.
     """
-
-    keep = scores.new(scores.size(0)).zero_().long()
-    if boxes.numel() == 0:
-        return keep
+    keep = torch.zeros([1, 1], dtype=torch.int64)
     x1 = boxes[:, 0]
     y1 = boxes[:, 1]
     x2 = boxes[:, 2]
     y2 = boxes[:, 3]
     area = torch.mul(x2 - x1, y2 - y1)
-    v, idx = scores.sort(0)  # sort in ascending order
-    # I = I[v >= 0.01]
-    idx = idx[-top_k:]  # indices of the top-k largest vals
-    xx1 = boxes.new()
-    yy1 = boxes.new()
-    xx2 = boxes.new()
-    yy2 = boxes.new()
-    w = boxes.new()
-    h = boxes.new()
-
-    # keep = torch.Tensor()
-    count = 0
-    while idx.numel() > 0:
-        i = idx[-1]  # index of current largest val
-        # keep.append(i)
-        keep[count] = i
-        count += 1
-        if idx.size(0) == 1:
-            break
-        idx = idx[:-1]  # remove kept element from view
+    v, idx = torch.topk(scores, scores.size(0), 0)
+    
+    while idx.numel() > 1:
+        # index of current largest val
+        i = idx[0]
+        ones = torch.ones([1, 1], dtype=torch.int64)
+        keep = torch.cat([keep, ones * i], 1)
+        # remove kept element from view
+        idx = idx[1:]
         # load bboxes of next highest vals
-        torch.index_select(x1, 0, idx, out=xx1)
-        torch.index_select(y1, 0, idx, out=yy1)
-        torch.index_select(x2, 0, idx, out=xx2)
-        torch.index_select(y2, 0, idx, out=yy2)
+        xx1 = torch.index_select(x1, 0, idx)
+        yy1 = torch.index_select(y1, 0, idx)
+        xx2 = torch.index_select(x2, 0, idx)
+        yy2 = torch.index_select(y2, 0, idx)
         # store element-wise max with next highest score
-        xx1 = torch.clamp(xx1, min=x1[i])
-        yy1 = torch.clamp(yy1, min=y1[i])
-        xx2 = torch.clamp(xx2, max=x2[i])
-        yy2 = torch.clamp(yy2, max=y2[i])
-        w.resize_as_(xx2)
-        h.resize_as_(yy2)
+        xx1 = torch.clamp(xx1, min=float(x1[i]))
+        yy1 = torch.clamp(yy1, min=float(y1[i]))
+        xx2 = torch.clamp(xx2, max=float(x2[i]))
+        yy2 = torch.clamp(yy2, max=float(y2[i]))
         w = xx2 - xx1
         h = yy2 - yy1
         # check sizes of xx1 and xx2.. after each iteration
         w = torch.clamp(w, min=0.0)
         h = torch.clamp(h, min=0.0)
-        inter = w*h
-        # IoU = i / (area(a) + area(b) - i)
-        rem_areas = torch.index_select(area, 0, idx)  # load remaining areas)
-        union = (rem_areas - inter) + area[i]
-        IoU = inter/union  # store result in iou
+        inter = w * h
+        # load remaining areas
+        rem_areas = torch.index_select(area, 0, idx)
+        union = rem_areas + area[i] - inter
+        iou = inter / union
         # keep only elements with an IoU <= overlap
-        idx = idx[IoU.le(overlap)]
-    return keep, count
+        idx = idx[iou.le(overlap)]
+
+    return keep.squeeze()[1:]

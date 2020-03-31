@@ -1,16 +1,69 @@
 import torch
+import torch.nn as nn
 from torch.autograd import Function
 from ..box_utils import decode, nms
 from data import voc as cfg
+import torchvision
 
 
-class Detect(Function):
+@torch.jit.script
+def batch_nms(loc_data, conf_data, prior_data):
+    num_priors = prior_data.size(0)
+    # scores'shape is [N, CLS]
+    scores = conf_data.view(num_priors, 21)
+    # bpxes's shape is [N, 4]
+    boxes = decode(loc_data[0], prior_data)
+
+    # create labels for each prediction
+    boxes = boxes.view(num_priors, 1, 4).expand(num_priors, 21, 4)
+    labels = torch.arange(21)
+    labels = labels.view(1, 21).expand_as(scores)
+
+    # remove predictions with the background label
+    boxes = boxes[:, 1:]
+    scores = scores[:, 1:]
+    labels = labels[:, 1:]
+    
+    # batch everything, by making every class prediction be a separate instance
+    boxes = boxes.reshape(-1, 4)
+    scores = scores.reshape(-1)
+    labels = labels.reshape(-1)
+    
+    # # remove low scoring boxes
+    inds = torch.nonzero(scores > 0.01).squeeze(1)
+    boxes, scores, labels = boxes[inds], scores[inds], labels[inds]
+
+    output = torch.zeros(1, 6)
+    if boxes.numel() == 0:
+        return output
+    else:
+        # strategy: in order to perform NMS independently per class.
+        # we add an offset to all the boxes. The offset is dependent
+        # only on the class idx, and is large enough so that boxes
+        # from different classes do not overlap
+        max_coordinate = boxes.max()
+        offsets = labels.to(boxes) * (max_coordinate + 1)
+        boxes_for_nms = boxes + offsets[:, None]
+        keep = nms(boxes_for_nms, scores, torch.tensor(0.45))
+        #keep = torchvision.ops.boxes.batched_nms(boxes, scores, labels, 0.45)
+
+        # keep only topk scoring predictions
+        keep = keep[:200]
+        boxes, scores, labels = boxes[keep], scores[keep], labels[keep]
+        labels = labels.to(torch.float32)
+        labels = labels.unsqueeze(1)
+        scores = scores.unsqueeze(1)
+        output = torch.cat((labels, scores, boxes), 1)
+        return output
+
+class Detect(nn.Module):
     """At test time, Detect is the final layer of SSD.  Decode location preds,
     apply non-maximum suppression to location predictions based on conf
     scores and threshold to a top_k number of output predictions for both
     confidence score and locations.
     """
     def __init__(self, num_classes, bkg_label, top_k, conf_thresh, nms_thresh):
+        super(Detect, self).__init__()
         self.num_classes = num_classes
         self.background_label = bkg_label
         self.top_k = top_k
@@ -32,31 +85,5 @@ class Detect(Function):
                 Shape: [1,num_priors,4]
         """
         num = loc_data.size(0)  # batch size
-        num_priors = prior_data.size(0)
-        output = torch.zeros(num, self.num_classes, self.top_k, 5)
-        conf_preds = conf_data.view(num, num_priors,
-                                    self.num_classes).transpose(2, 1)
-
-        # Decode predictions into bboxes.
-        for i in range(num):
-            decoded_boxes = decode(loc_data[i], prior_data, self.variance)
-            # For each class, perform nms
-            conf_scores = conf_preds[i].clone()
-
-            for cl in range(1, self.num_classes):
-                c_mask = conf_scores[cl].gt(self.conf_thresh)
-                scores = conf_scores[cl][c_mask]
-                if scores.size(0) == 0:
-                    continue
-                l_mask = c_mask.unsqueeze(1).expand_as(decoded_boxes)
-                boxes = decoded_boxes[l_mask].view(-1, 4)
-                # idx of highest scoring and non-overlapping boxes per class
-                ids, count = nms(boxes, scores, self.nms_thresh, self.top_k)
-                output[i, cl, :count] = \
-                    torch.cat((scores[ids[:count]].unsqueeze(1),
-                               boxes[ids[:count]]), 1)
-        flt = output.contiguous().view(num, -1, 5)
-        _, idx = flt[:, :, 0].sort(1, descending=True)
-        _, rank = idx.sort(1)
-        flt[(rank < self.top_k).unsqueeze(-1).expand_as(flt)].fill_(0)
+        output = batch_nms(loc_data, conf_data, prior_data)
         return output
